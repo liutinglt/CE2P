@@ -7,7 +7,7 @@ The code is based upon [https://github.com/speedinghzl/Pytorch-Deeplab](https://
 ### Requirements
 
 To install PyTorch, please refer to https://github.com/pytorch/pytorch#installation.
-
+The version of PyTorch we used is 0.3.1
 ### Compiling
 
 Some parts of InPlace-ABN have a native CUDA implementation, which must be compiled with the following commands:
