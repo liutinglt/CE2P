@@ -25,7 +25,7 @@ Note that the left and right label should be swapped when the label file is flip
 
 Plesae download LIP dataset and modify the `DATA_DIRECTORY` in job_train.sh. 
  
-Please download imagenet pretrained resent-101, label files of edge and the trained models from [baidu drive](https://pan.baidu.com/s/15Fxrqe-kF4-tNuh3gka2DQ), and put it into dataset folder.
+Please download imagenet pretrained resent-101, label files of edge and the trained models from [baidu drive](https://pan.baidu.com/s/15Fxrqe-kF4-tNuh3gka2DQ) or [Google drive](https://drive.google.com/drive/folders/19I_MzMYzm2EYNvid9ySRvq66g_tZgkjm?usp=sharing), and put it into dataset folder.
 
 ### Training and Evaluation
 ```bash
