@@ -21,7 +21,7 @@ The CUDA kernels are compiled for `sm_50`, `sm_52` and `sm_61` by default.
 To change this (_e.g._ if you are using a Kepler GPU), please edit the `CUDA_GENCODE` variable in `build.sh`.
 
 ### Dataset and pretrained model
-Note that the left and right label should be swapped when the label file is flipped. 
+**Note** that the left and right label should be swapped when the label file is flipped. 
 
 Plesae download LIP dataset and modify the `DATA_DIRECTORY` in job_train.sh. 
  
