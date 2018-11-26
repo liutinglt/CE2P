@@ -34,9 +34,9 @@ Please download imagenet pretrained resent-101, label files of edge and the trai
 ``` 
 If this code is helpful for your research, please cite the following paper:
 
-    @article{LiuCE2P,
+    @article{CE2P2019,
       title={Devil in the Details: Towards Accurate Single and Multiple Human Parsing},
-      author={Ting Liu, Tao Ruan, Zilong Huang, Yunchao Wei, Shikui Wei, Yao Zhao, Thomas Huang},
+      author={Tao Ruan, Ting Liu, Zilong Huang, Yunchao Wei, Shikui Wei, Yao Zhao, Thomas Huang},
       journal={arXiv:1809.05996},
       year={2018}
     }
