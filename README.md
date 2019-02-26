@@ -6,12 +6,15 @@ The code is based upon [https://github.com/speedinghzl/pytorch-segmentation-tool
 
 ### Requirements
 
-python 3.6
-PyTorch 0.4.1
-To install PyTorch, please refer to https://github.com/pytorch/pytorch#installation.
+python 3.6   
 
-Or using anaconda:  conda env create -f environment.yaml
- 
+PyTorch 0.4.1  
+
+To install PyTorch, please refer to https://github.com/pytorch/pytorch#installation.  
+
+
+Or using anaconda:  conda env create -f environment.yaml  
+
 ### Compiling
 
 Some parts of InPlace-ABN have a native CUDA implementation, which must be compiled with the following commands:
@@ -32,22 +35,32 @@ ln -s YOUR_LIP_DATASET_DIR dataset/LIP
   
 The contents of LIP Dataset include: 
 
-├── train_images
-├── train_segmentations
-├── val_images
-├── val_segmentations
-├── test_images 
-├── train_id.txt
-├── val_id.txt
-├── test_id.txt
+├── train_images   
 
+├── train_segmentations  
+
+├── val_images  
+
+├── val_segmentations  
+
+├── test_images   
+
+├── train_id.txt  
+
+├── val_id.txt  
+
+├── test_id.txt  
+
+ 
 Please download imagenet pretrained resent-101 from [baidu drive](https://pan.baidu.com/s/1NoxI_JetjSVa7uqgVSKdPw) or [Google drive](https://drive.google.com/open?id=1rzLU-wK6rEorCNJfwrmIu5hY2wRMyKTK), and put it into dataset folder.
 
 ### Training and Evaluation
 ```bash
 ./run.sh
-
+```
 To evaluate the results, please download 'LIP_epoch_149.pth' from [baidu drive](https://pan.baidu.com/s/1NoxI_JetjSVa7uqgVSKdPw) or [Google drive](https://drive.google.com/open?id=1rzLU-wK6rEorCNJfwrmIu5hY2wRMyKTK), and put into snapshots directory.
+
+```
 ./run_evaluate.sh
 ``` 
 If this code is helpful for your research, please cite the following paper:
