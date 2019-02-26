@@ -58,11 +58,13 @@ Please download imagenet pretrained resent-101 from [baidu drive](https://pan.ba
 ```bash
 ./run.sh
 ```
-To evaluate the results, please download 'LIP_epoch_149.pth' from [baidu drive](https://pan.baidu.com/s/1NoxI_JetjSVa7uqgVSKdPw) or [Google drive](https://drive.google.com/open?id=1rzLU-wK6rEorCNJfwrmIu5hY2wRMyKTK), and put into snapshots directory.
-
+To evaluate the results, please download 'LIP_epoch_149.pth' from [baidu drive](https://pan.baidu.com/s/1NoxI_JetjSVa7uqgVSKdPw) or [Google drive](https://drive.google.com/open?id=1rzLU-wK6rEorCNJfwrmIu5hY2wRMyKTK), and put into snapshots directory. 
 ```
 ./run_evaluate.sh
 ``` 
+The parsing result of the provided 'LIP_epoch_149.pth' is 53.88 without any bells and whistles,
+![53.88](result.png)
+
 If this code is helpful for your research, please cite the following paper:
 
     @article{CE2P2019,
