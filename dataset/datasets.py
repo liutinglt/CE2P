@@ -1,187 +1,130 @@
 import os
-import os.path as osp
 import numpy as np
 import random
-import collections
 import torch
-import torchvision
 import cv2
-from torch.utils import data 
-from PIL import Image as PILImage
- 
- 
-class LIPParsingEdgeDataSet(data.Dataset):
-    def __init__(self, root, list_path, max_iters=None, crop_size=(473, 473), mean=(128, 128, 128), scale=True, mirror=True, ignore_label=255):
+import json
+from torch.utils import data
+from dataset.target_generation import generate_edge
+from utils.transforms import get_affine_transform
+
+
+class LIPDataSet(data.Dataset):
+    def __init__(self, root, dataset, crop_size=[473, 473], scale_factor=0.25,
+                 rotation_factor=30, ignore_label=255, transform=None):
+        """
+        :rtype:
+        """
         self.root = root
-        self.list_path = list_path
-        self.crop_h, self.crop_w = crop_size
-        self.scale = scale
+        self.aspect_ratio = crop_size[1] * 1.0 / crop_size[0]
+        self.crop_size = np.asarray(crop_size)
         self.ignore_label = ignore_label
-        self.mean = mean
-        self.is_mirror = mirror 
-        
-        self.img_ids = [i_id.strip().split() for i_id in open(list_path)]
-        if not max_iters==None:
-            self.img_ids = self.img_ids * int(np.ceil(float(max_iters) / len(self.img_ids))) 
-                
-        self.files = []
-         
-        for item in self.img_ids:
-            image_path, label_path, label_rev_path, edge_path = item
-            name = osp.splitext(osp.basename(label_path))[0]  
-            img_file = osp.join(self.root, image_path)
-            label_file = osp.join(self.root, label_path) 
-            label_rev_file = osp.join(self.root, label_rev_path)
-            edge_file = osp.join(self.root, edge_path)
-            self.files.append({
-                "img": img_file,
-                "label": label_file,
-                "label_rev": label_rev_file, 
-                "edge": edge_file,
-                "name": name
-            })
-          
-    def __len__(self):
-        return len(self.files)
- 
-    def generate_scale_label(self, image, label, edge):
-        f_scale = 0.5 + random.randint(0, 11) / 10.0
-        image = cv2.resize(image, None, fx=f_scale, fy=f_scale, interpolation = cv2.INTER_LINEAR)
-        label = cv2.resize(label, None, fx=f_scale, fy=f_scale, interpolation = cv2.INTER_NEAREST)
-        edge = cv2.resize(edge, None, fx=f_scale, fy=f_scale, interpolation = cv2.INTER_NEAREST)
-         
-        return image, label, edge
-     
-    def __getitem__(self, index):
-        datafiles = self.files[index]
-          
-        name = datafiles["name"]  
-         
-        image = cv2.imread(datafiles["img"], cv2.IMREAD_COLOR)
-        label = cv2.imread(datafiles["label"], cv2.IMREAD_GRAYSCALE)
-        edge = cv2.imread(datafiles["edge"], cv2.IMREAD_GRAYSCALE)
-        edge[edge==255] = 1
-        label_rev = cv2.imread(datafiles["label_rev"], cv2.IMREAD_GRAYSCALE)
-         
-        size = image.shape 
-        if self.is_mirror:
-            flip = np.random.choice(2) * 2 - 1
-            image = image[:, ::flip, :] 
-            edge = edge[:, ::flip] 
-            if flip == -1:
-                label = label_rev 
+        self.scale_factor = scale_factor
+        self.rotation_factor = rotation_factor
+        self.flip_prob = 0.5
+        self.flip_pairs = [[0, 5], [1, 4], [2, 3], [11, 14], [12, 13], [10, 15]]
+        self.transform = transform
+        self.dataset = dataset
 
-        if self.scale:
-            image, label, edge = self.generate_scale_label(image, label, edge)
-            
-        image = np.asarray(image, np.float32)
-        image -= self.mean
-        img_h, img_w = label.shape
-        pad_h = max(self.crop_h - img_h, 0)
-        pad_w = max(self.crop_w - img_w, 0)
-        
-        if pad_h > 0 or pad_w > 0:
-            img_pad = cv2.copyMakeBorder(image, 0, pad_h, 0, 
-                pad_w, cv2.BORDER_CONSTANT, 
-                value=(0.0, 0.0, 0.0))
-            label_pad = cv2.copyMakeBorder(label, 0, pad_h, 0, 
-                pad_w, cv2.BORDER_CONSTANT,
-                value=(self.ignore_label,))
-            edge_pad = cv2.copyMakeBorder(edge, 0, pad_h, 0, 
-                pad_w, cv2.BORDER_CONSTANT,
-                value=(0.0,))
+        list_path = os.path.join(self.root, self.dataset + '_id.txt')
+
+        self.im_list = [i_id.strip() for i_id in open(list_path)]
+        self.number_samples = len(self.im_list)
+
+    def __len__(self):
+        return self.number_samples
+
+    def _box2cs(self, box):
+        x, y, w, h = box[:4]
+        return self._xywh2cs(x, y, w, h)
+
+    def _xywh2cs(self, x, y, w, h):
+        center = np.zeros((2), dtype=np.float32)
+        center[0] = x + w * 0.5
+        center[1] = y + h * 0.5
+        if w > self.aspect_ratio * h:
+            h = w * 1.0 / self.aspect_ratio
+        elif w < self.aspect_ratio * h:
+            w = h * self.aspect_ratio
+        scale = np.array([w * 1.0, h * 1.0], dtype=np.float32)
+
+        return center, scale
+
+    def __getitem__(self, index):
+        # Load training image
+        im_name = self.im_list[index]
+
+        im_path = os.path.join(self.root, self.dataset + '_images', im_name + '.jpg')
+        parsing_anno_path = os.path.join(self.root, self.dataset + '_segmentations', im_name + '.png')
+
+        im = cv2.imread(im_path, cv2.IMREAD_COLOR)
+        h, w, _ = im.shape
+        parsing_anno = np.zeros((h, w), dtype=np.long)
+
+        # Get center and scale
+        center, s = self._box2cs([0, 0, w - 1, h - 1])
+        r = 0
+
+        if self.dataset != 'test': 
+            parsing_anno = cv2.imread(parsing_anno_path, cv2.IMREAD_GRAYSCALE)
+
+            if self.dataset == 'train' or self.dataset == 'trainval':
+
+                sf = self.scale_factor
+                rf = self.rotation_factor
+                s = s * np.clip(np.random.randn() * sf + 1, 1 - sf, 1 + sf)
+                r = np.clip(np.random.randn() * rf, -rf * 2, rf * 2) \
+                    if random.random() <= 0.6 else 0
+
+                if random.random() <= self.flip_prob:
+                    im = im[:, ::-1, :]
+                    parsing_anno = parsing_anno[:, ::-1]
+
+                    center[0] = im.shape[1] - center[0] - 1
+                    right_idx = [15, 17, 19]
+                    left_idx = [14, 16, 18]
+                    for i in range(0, 3):
+                        right_pos = np.where(parsing_anno == right_idx[i])
+                        left_pos = np.where(parsing_anno == left_idx[i])
+                        parsing_anno[right_pos[0], right_pos[1]] = left_idx[i]
+                        parsing_anno[left_pos[0], left_pos[1]] = right_idx[i]
+
+        trans = get_affine_transform(center, s, r, self.crop_size)
+        input = cv2.warpAffine(
+            im,
+            trans,
+            (int(self.crop_size[1]), int(self.crop_size[0])),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0))
+
+        if self.transform:
+            input = self.transform(input)
+
+        meta = {
+            'name': im_name,
+            'center': center,
+            'height': h,
+            'width': w,
+            'scale': s,
+            'rotation': r
+        }
+
+        if self.dataset != 'train':
+            return input, meta
         else:
-            img_pad, label_pad, edge_pad = image, label, edge
 
-        img_h, img_w = label_pad.shape
-        h_off = random.randint(0, img_h - self.crop_h)
-        w_off = random.randint(0, img_w - self.crop_w) 
-        image = np.asarray(img_pad[h_off : h_off+self.crop_h, w_off : w_off+self.crop_w], np.float32)
-        label = np.asarray(label_pad[h_off : h_off+self.crop_h, w_off : w_off+self.crop_w], np.float32)
-        edge = np.asarray(edge_pad[h_off : h_off+self.crop_h, w_off : w_off+self.crop_w], np.float32)
-       
-        image = image.transpose((2, 0, 1)) 
-        return image.copy(), label.copy(), edge.copy(), np.array(size), name    
-  
-class LIPDataValSet(data.Dataset):
-    def __init__(self, root, list_path, crop_size=(473, 473), mean=(128, 128, 128)):
-        self.root = root 
-        self.list_path = list_path
-        self.crop_h, self.crop_w = crop_size
-        self.mean = mean
-         
-        self.img_ids = [i_id.strip().split() for i_id in open(list_path)]
-        self.files = [] 
+            label_parsing = cv2.warpAffine(
+                parsing_anno,
+                trans,
+                (int(self.crop_size[1]), int(self.crop_size[0])),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(255))
 
-        for item in self.img_ids:
-            image_path, label_path = item
-            name = osp.splitext(osp.basename(image_path))[0]
-            img_file = osp.join(self.root, image_path)
-            label_file = osp.join(self.root, label_path) 
-            self.files.append({
-                "img": img_file,  
-                "label": label_file,
-                "name": name
-            }) 
-    def generate_scale_image(self, image, f_scale): 
-        image = cv2.resize(image, None, fx=f_scale, fy=f_scale, interpolation = cv2.INTER_LINEAR) 
-        return image
-    
-    def resize_image(self, image, size): 
-        image = cv2.resize(image, size, interpolation = cv2.INTER_LINEAR) 
-        return image
-    
-    def __len__(self):
-        return len(self.files)
+            label_edge = generate_edge(label_parsing)
 
-    def __getitem__(self, index):
-        datafiles = self.files[index]
-        image = cv2.imread(datafiles["img"], cv2.IMREAD_COLOR)   
-        label = cv2.imread(datafiles["label"], cv2.IMREAD_GRAYSCALE)
-        ori_size = image.shape
-        image = self.resize_image(image, (self.crop_h, self.crop_w))
-         
-        name = datafiles["name"]
-        image = np.asarray(image, np.float32)
-        image -= self.mean
-         
-        image = image.transpose((2, 0, 1))
-        return image, label,  np.array(ori_size), name
-     
- 
-class LIPDataTestSet(data.Dataset):
-    def __init__(self, root, list_path, crop_size=(473, 473), mean=(128, 128, 128)):
-        self.root = root 
-        self.list_path = list_path
-        self.crop_h, self.crop_w = crop_size
-        self.mean = mean
-         
-        self.img_ids = [i_id.strip().split()[0] for i_id in open(list_path)]
-        self.files = []  
-        for image_path in self.img_ids:
-            name = osp.splitext(osp.basename(image_path))[0]
-            img_file = osp.join(self.root, image_path) 
-            self.files.append({
-                "img": img_file 
-            })
+            label_parsing = torch.from_numpy(label_parsing)
+            label_edge = torch.from_numpy(label_edge)
 
-    def __len__(self):
-        return len(self.files)
-    
-    def resize_image(self, image, size): 
-        image = cv2.resize(image, size, interpolation = cv2.INTER_LINEAR) 
-        return image
-    
-    def __getitem__(self, index):
-        datafiles = self.files[index] 
-        name = osp.splitext(osp.basename(datafiles["img"]))[0]
-        image = cv2.imread(datafiles["img"], cv2.IMREAD_COLOR)  
-        ori_size = image.shape 
-        image = self.resize_image(image, (self.crop_h, self.crop_w))
-         
-        image = np.asarray(image, np.float32)
-        image -= self.mean 
-        image = image.transpose((2, 0, 1))
-        
-        return image, np.array(ori_size), name
-    
+            return input, label_parsing, label_edge, meta

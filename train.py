@@ -1,84 +1,81 @@
-import argparse 
+import argparse
+
 import torch
-import torch.nn as nn
+torch.multiprocessing.set_start_method("spawn", force=True)
 from torch.utils import data
 import numpy as np
-import pickle
-import cv2
-from torch.autograd import Variable
 import torch.optim as optim
-import scipy.misc
+import torchvision.utils as vutils
 import torch.backends.cudnn as cudnn
-import sys
 import os
 import os.path as osp
-import math 
-import random
+from networks.CE2P import Res_Deeplab
+from dataset.datasets import LIPDataSet
+import torchvision.transforms as transforms
 import timeit
-import logging
 from tensorboardX import SummaryWriter
-from models import Res_CE2P
-from dataset.datasets import LIPParsingEdgeDataSet
-from utils.utils import decode_labels, inv_preprocess, decode_predictions
-from utils.criterion import CriterionCrossEntropyEdgeParsing 
-from utils.encoding import SelfDataParallel, ModelDataParallel, CriterionDataParallel
-from numpy.distutils.tests.test_exec_command import emulate_nonposix
- 
+from utils.utils import decode_parsing, inv_preprocess
+from utils.criterion import CriterionAll
+from utils.encoding import DataParallelModel, DataParallelCriterion 
+from utils.miou import compute_mean_ioU
+from evaluate import valid
+
 start = timeit.default_timer()
-
-IMG_MEAN = np.array((104.00698793,116.66876762,122.67891434), dtype=np.float32)
-
-BATCH_SIZE = 40
-DATA_DIRECTORY = '/home/amax/LIP/LIP_data_model/data/resize473/split'
-DATA_LIST_PATH = './dataset/list/lip/trainList_split.txt'
+  
+BATCH_SIZE = 8
+DATA_DIRECTORY = 'cityscapes'
+DATA_LIST_PATH = './dataset/list/cityscapes/train.lst'
 IGNORE_LABEL = 255
-INPUT_SIZE = '473, 473'
-LEARNING_RATE = 7e-4
+INPUT_SIZE = '769,769'
+LEARNING_RATE = 1e-2
 MOMENTUM = 0.9
 NUM_CLASSES = 20
-NUM_STEPS = 300000
 POWER = 0.9
 RANDOM_SEED = 1234
 RESTORE_FROM = './dataset/MS_DeepLab_resnet_pretrained_init.pth'
 SAVE_NUM_IMAGES = 2
-SAVE_PRED_EVERY = 1000
+SAVE_PRED_EVERY = 10000
 SNAPSHOT_DIR = './snapshots/'
 WEIGHT_DECAY = 0.0005
-GPU_DEVICES = '0,1,2,3,4' 
+ 
+def str2bool(v):
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
 
 def get_arguments():
     """Parse all the arguments provided from the CLI.
-    
+
     Returns:
       A list of parsed arguments.
     """
-    parser = argparse.ArgumentParser(description="DeepLab-ResNet Network")
+    parser = argparse.ArgumentParser(description="CE2P Network")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE,
                         help="Number of images sent to the network in one step.")
     parser.add_argument("--data-dir", type=str, default=DATA_DIRECTORY,
-                        help="Path to the directory containing the PASCAL VOC dataset.")
-    parser.add_argument("--data-list", type=str, default=DATA_LIST_PATH,
+                        help="Path to the directory containing the dataset.")
+    parser.add_argument("--dataset", type=str, default='train', choices=['train', 'val', 'trainval', 'test'],
                         help="Path to the file listing the images in the dataset.")
     parser.add_argument("--ignore-label", type=int, default=IGNORE_LABEL,
                         help="The index of the label to ignore during the training.")
     parser.add_argument("--input-size", type=str, default=INPUT_SIZE,
                         help="Comma-separated string with height and width of images.")
-    parser.add_argument("--is-training", action="store_true",
-                        help="Whether to updates the running means and variances during the training.")
     parser.add_argument("--learning-rate", type=float, default=LEARNING_RATE,
                         help="Base learning rate for training with polynomial decay.")
     parser.add_argument("--momentum", type=float, default=MOMENTUM,
                         help="Momentum component of the optimiser.")
-    parser.add_argument("--not-restore-last", action="store_true",
-                        help="Whether to not restore last (FC) layers.")
     parser.add_argument("--num-classes", type=int, default=NUM_CLASSES,
-                        help="Number of classes to predict (including background).")
+                        help="Number of classes to predict (including background).") 
     parser.add_argument("--start-iters", type=int, default=0,
-                        help="Number of classes to predict (including background).")
-    parser.add_argument("--num-steps", type=int, default=NUM_STEPS,
-                        help="Number of training steps.")
+                        help="Number of classes to predict (including background).") 
     parser.add_argument("--power", type=float, default=POWER,
                         help="Decay parameter to compute the learning rate.")
+    parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY,
+                        help="Regularisation parameter for L2-loss.")
     parser.add_argument("--random-mirror", action="store_true",
                         help="Whether to randomly mirror the inputs during the training.")
     parser.add_argument("--random-scale", action="store_true",
@@ -89,132 +86,189 @@ def get_arguments():
                         help="Where restore model parameters from.")
     parser.add_argument("--save-num-images", type=int, default=SAVE_NUM_IMAGES,
                         help="How many images to save.")
-    parser.add_argument("--save-pred-every", type=int, default=SAVE_PRED_EVERY,
-                        help="Save summaries and checkpoint every often.")
     parser.add_argument("--snapshot-dir", type=str, default=SNAPSHOT_DIR,
                         help="Where to save snapshots of the model.")
-    parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY,
-                        help="Regularisation parameter for L2-loss.")
-    parser.add_argument("--gpu", type=str, default=GPU_DEVICES,
-                        help="choose gpu device.")   
+    parser.add_argument("--gpu", type=str, default='None',
+                        help="choose gpu device.")
+    parser.add_argument("--start-epoch", type=int, default=0,
+                        help="choose the number of recurrence.")
+    parser.add_argument("--epochs", type=int, default=150,
+                        help="choose the number of recurrence.")
     return parser.parse_args()
 
+
 args = get_arguments()
- 
-          
+
+
 def lr_poly(base_lr, iter, max_iter, power):
-    return base_lr*((1-float(iter)/max_iter)**(power))
- 
-def adjust_learning_rate(optimizer, i_iter): 
-     
-    lr = lr_poly(args.learning_rate, i_iter, args.num_steps, args.power)     
-        
+    return base_lr * ((1 - float(iter) / max_iter) ** (power))
+
+
+def adjust_learning_rate(optimizer, i_iter, total_iters):
+    """Sets the learning rate to the initial LR divided by 5 at 60th, 120th and 160th epochs"""
+    lr = lr_poly(args.learning_rate, i_iter, total_iters, args.power)
     optimizer.param_groups[0]['lr'] = lr
     return lr
+
+
+def adjust_learning_rate_pose(optimizer, epoch):
+    decay = 0
+    if epoch + 1 >= 230:
+        decay = 0.05
+    elif epoch + 1 >= 200:
+        decay = 0.1
+    elif epoch + 1 >= 120:
+        decay = 0.25
+    elif epoch + 1 >= 90:
+        decay = 0.5
+    else:
+        decay = 1
+
+    lr = args.learning_rate * decay
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    return lr
+
 
 def set_bn_eval(m):
     classname = m.__class__.__name__
     if classname.find('BatchNorm') != -1:
         m.eval()
 
+
 def set_bn_momentum(m):
     classname = m.__class__.__name__
     if classname.find('BatchNorm') != -1 or classname.find('InPlaceABN') != -1:
         m.momentum = 0.0003
 
+
 def main():
     """Create the model and start the training."""
-    writer = SummaryWriter(args.snapshot_dir)
-    
-    os.environ["CUDA_VISIBLE_DEVICES"]=args.gpu
-    h, w = map(int, args.input_size.split(','))
-    input_size = (h, w)
-
-    cudnn.enabled = True
- 
-    deeplab = Res_CE2P(num_classes=args.num_classes) 
-
-    saved_state_dict = torch.load(args.restore_from)
-    new_params = deeplab.state_dict().copy()
-  
-    for i in saved_state_dict: 
-        i_parts = i.split('.') 
-        if not i_parts[1]=='layer5':
-            new_params['.'.join(i_parts[1:])] = saved_state_dict[i]
-    if args.start_iters > 0:
-        deeplab.load_state_dict(saved_state_dict)
-    else:
-        deeplab.load_state_dict(new_params)
-    print(deeplab) 
-    model = ModelDataParallel(deeplab) 
-    model.train()
-    model.float() 
-    model.cuda()    
- 
-    criterion = CriterionCrossEntropyEdgeParsing()
-    criterion = CriterionDataParallel(criterion)
-    criterion.cuda()
-    
-    cudnn.benchmark = True
 
     if not os.path.exists(args.snapshot_dir):
         os.makedirs(args.snapshot_dir)
 
+    writer = SummaryWriter(args.snapshot_dir)
+    gpus = [int(i) for i in args.gpu.split(',')]
+    if not args.gpu == 'None':
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
-    trainloader = data.DataLoader(LIPParsingEdgeDataSet(args.data_dir, args.data_list, max_iters=args.num_steps*args.batch_size, crop_size=input_size, 
-                    scale=args.random_scale, mirror=args.random_mirror, mean=IMG_MEAN), 
-                    batch_size=args.batch_size, shuffle=True, num_workers=8, pin_memory=True)
+    h, w = map(int, args.input_size.split(','))
+    input_size = [h, w]
 
-    optimizer = optim.SGD([{'params': filter(lambda p: p.requires_grad, deeplab.parameters()), 'lr': args.learning_rate }], 
-                lr=args.learning_rate, momentum=args.momentum,weight_decay=args.weight_decay)
+    cudnn.enabled = True
+    # cudnn related setting
+    cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.enabled = True
+ 
+
+    deeplab = Res_Deeplab(num_classes=args.num_classes)
+
+    # dump_input = torch.rand((args.batch_size, 3, input_size[0], input_size[1]))
+    # writer.add_graph(deeplab.cuda(), dump_input.cuda(), verbose=False)
+
+    saved_state_dict = torch.load(args.restore_from)
+    new_params = deeplab.state_dict().copy()
+    for i in saved_state_dict:
+        i_parts = i.split('.')
+        # print(i_parts)
+        if not i_parts[0] == 'fc':
+            new_params['.'.join(i_parts[0:])] = saved_state_dict[i]
+
+    deeplab.load_state_dict(new_params)
+   
+    model = DataParallelModel(deeplab)
+    model.cuda()
+
+    criterion = CriterionAll()
+    criterion = DataParallelCriterion(criterion)
+    criterion.cuda()
+
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        normalize,
+    ])
+
+    trainloader = data.DataLoader(LIPDataSet(args.data_dir, args.dataset, crop_size=input_size, transform=transform),
+                                  batch_size=args.batch_size * len(gpus), shuffle=True, num_workers=2,
+                                  pin_memory=True)
+    #lip_dataset = LIPDataSet(args.data_dir, 'val', crop_size=input_size, transform=transform)
+    #num_samples = len(lip_dataset)
+    
+    #valloader = data.DataLoader(lip_dataset, batch_size=args.batch_size * len(gpus),
+    #                             shuffle=False, pin_memory=True)
+
+    optimizer = optim.SGD(
+        model.parameters(),
+        lr=args.learning_rate,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay
+    )
     optimizer.zero_grad()
-  
-    for i_iter, batch in enumerate(trainloader):
-        i_iter += args.start_iters
-        images, labels, edges, _, _ = batch
-        images = Variable(images.cuda())
-        labels = Variable(labels.long().cuda())
-        edges =  Variable(edges.long().cuda())
 
-        optimizer.zero_grad()
-        lr = adjust_learning_rate(optimizer, i_iter)
-        preds = model(images) 
-        loss = criterion(preds, [labels,edges])
-        loss.backward()
-        optimizer.step()
+    total_iters = args.epochs * len(trainloader)
+    for epoch in range(args.start_epoch, args.epochs):
+        model.train()
+        for i_iter, batch in enumerate(trainloader):
+            i_iter += len(trainloader) * epoch
+            lr = adjust_learning_rate(optimizer, i_iter, total_iters)
 
-        if i_iter % 100 == 0:
-            writer.add_scalar('learning_rate', lr, i_iter)
-            writer.add_scalar('loss', loss.data.cpu().numpy(), i_iter)
+            images, labels, edges, _ = batch
+            labels = labels.long().cuda(non_blocking=True)
+            edges = edges.long().cuda(non_blocking=True)
 
-        if i_iter % args.save_pred_every == 0:
-            images_inv = inv_preprocess(images, args.save_num_images, IMG_MEAN)
-            labels_colors = decode_labels(labels, args.save_num_images, args.num_classes)
-            edges_colors =  decode_labels(edges, args.save_num_images, 2) 
-            if isinstance(preds, list):
-                preds = preds[0] 
-            preds_colors = decode_predictions(preds[1], args.save_num_images, args.num_classes)
-            pred_edges_colors = decode_predictions(preds[2], args.save_num_images, args.num_classes)
-            for index, (img, lab) in enumerate(zip(images_inv, labels_colors)):
-                writer.add_image('Images/'+str(index), img, i_iter)
-                writer.add_image('Labels/'+str(index), lab, i_iter)
-                writer.add_image('preds/'+str(index), preds_colors[index], i_iter)
-                writer.add_image('edges/'+str(index), edges_colors[index], i_iter)
-                writer.add_image('pred_edges/'+str(index), pred_edges_colors[index], i_iter) 
-              
-        print('iter = {} of {} completed, loss = {}, learning_rate = {:e}'.format(i_iter, args.num_steps, loss.data.cpu().numpy(), lr))
+            preds = model(images)
 
-        if i_iter >= args.num_steps-1:
-            print('save model ...')
-            torch.save(deeplab.state_dict(),osp.join(args.snapshot_dir, 'LIP_'+str(args.num_steps)+'.pth'))                                                                         
-            break
+            loss = criterion(preds, [labels, edges])
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-        if i_iter % args.save_pred_every == 0:
-            print('taking snapshot ...')
-            torch.save(deeplab.state_dict(),osp.join(args.snapshot_dir, 'LIP_'+str(i_iter)+'.pth'))     
+            if i_iter % 100 == 0:
+                writer.add_scalar('learning_rate', lr, i_iter)
+                writer.add_scalar('loss', loss.data.cpu().numpy(), i_iter)
+
+            if i_iter % 500 == 0:
+
+                images_inv = inv_preprocess(images, args.save_num_images)
+                labels_colors = decode_parsing(labels, args.save_num_images, args.num_classes, is_pred=False)
+                edges_colors = decode_parsing(edges, args.save_num_images, 2, is_pred=False)
+
+                if isinstance(preds, list):
+                    preds = preds[0]
+                preds_colors = decode_parsing(preds[0][-1], args.save_num_images, args.num_classes, is_pred=True)
+                pred_edges = decode_parsing(preds[1][-1], args.save_num_images, 2, is_pred=True)
+
+                img = vutils.make_grid(images_inv, normalize=False, scale_each=True)
+                lab = vutils.make_grid(labels_colors, normalize=False, scale_each=True)
+                pred = vutils.make_grid(preds_colors, normalize=False, scale_each=True)
+                edge = vutils.make_grid(edges_colors, normalize=False, scale_each=True)
+                pred_edge = vutils.make_grid(pred_edges, normalize=False, scale_each=True)
+
+                writer.add_image('Images/', img, i_iter)
+                writer.add_image('Labels/', lab, i_iter)
+                writer.add_image('Preds/', pred, i_iter)
+                writer.add_image('Edges/', edge, i_iter)
+                writer.add_image('PredEdges/', pred_edge, i_iter)
+
+            print('iter = {} of {} completed, loss = {}'.format(i_iter, total_iters, loss.data.cpu().numpy()))
+
+        torch.save(model.state_dict(), osp.join(args.snapshot_dir, 'LIP_epoch_' + str(epoch) + '.pth'))
+
+        #parsing_preds, scales, centers = valid(model, valloader, input_size,  num_samples, len(gpus))
+
+        #mIoU = compute_mean_ioU(parsing_preds, scales, centers, args.num_classes, args.data_dir, input_size)
+
+        #print(mIoU)
+        #writer.add_scalars('mIoU', mIoU, epoch)
 
     end = timeit.default_timer()
-    print(end-start,'seconds')
+    print(end - start, 'seconds')
+ 
 
 if __name__ == '__main__':
     main()

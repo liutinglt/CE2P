@@ -5,113 +5,75 @@
 ## Copyright (c) 2017
 ##
 ## This source code is licensed under the MIT-style license found in the
-## LICENSE file in the root directory of this source tree 
+## LICENSE file in the root directory of this source tree
 ##+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
+"""Encoding Data Parallel"""
 import threading
+import functools
 import torch
-import torch.cuda.nccl as nccl
-import torch.cuda.comm as comm
 from torch.autograd import Variable, Function
-from torch.nn.modules import Module
-from torch.nn.parallel.scatter_gather import scatter, scatter_kwargs, \
-    gather
-from torch.nn.parallel.replicate import replicate
-from torch.nn.parallel.parallel_apply import parallel_apply
+import torch.cuda.comm as comm
+from torch.nn.parallel.data_parallel import DataParallel
+from torch.nn.parallel.parallel_apply import get_a_var
+from torch.nn.parallel._functions import ReduceAddCoalesced, Broadcast
 
-__all__ = ['Reduce', 'AllReduce', 'Broadcast', 'ModelDataParallel', 
-    'CriterionDataParallel', 'SelfDataParallel']
+torch_ver = torch.__version__[:3]
 
-def nccl_all_reduce(inputs):
-    # TODO, figure out why nccl all_reduce doesn't work for gradcheck
-    input_size = inputs[0].size()
-    #if nccl.is_available(inputs):
-    for i, inp in enumerate(inputs):
-        assert inp.is_cuda, \
-            "reduce_add expects all inputs to be on GPUs"
-        if inp.size() != input_size:
-            got = 'x'.join(str(x) for x in inp.size())
-            expected = 'x'.join(str(x) for x in input_size)
-            raise ValueError("input {} has invalid size: got {}, \
-                but expected {}".format(i, got, expected))
-    nccl.all_reduce(inputs)
-    return inputs
+__all__ = ['allreduce', 'DataParallelModel', 'DataParallelCriterion',
+           'patch_replication_callback']
 
-def comm_all_reduce(inputs):
-    # comm backend
-    result = comm.reduce_add(inputs)
-    results = []
-    for i in range(len(inputs)):
-        results.append(result.clone().cuda(i))
-    return results
-
-class Reduce(Function):
-    def forward(ctx, *inputs):
-        ctx.save_for_backward(*inputs)
-        if len(inputs) == 1:
-            return inputs[0]
-        return comm.reduce_add(inputs)
-
-    def backward(ctx, gradOutput):
-        inputs = tuple(ctx.saved_tensors)
-        if len(inputs) == 1:
-            return gradOutput
-        gradInputs = []
-        for i in range(len(inputs)):
-            with torch.cuda.device_of(inputs[i]):
-                gradInputs.append(gradOutput.cuda())
-        return tuple(gradInputs)
-
-class AllReduce(Function):
+def allreduce(*inputs):
     """Cross GPU all reduce autograd operation for calculate mean and
     variance in SyncBN.
     """
-    def forward(ctx, *inputs):
-        outputs = comm_all_reduce(list(inputs))
-        return tuple(outputs)
+    return AllReduce.apply(*inputs)
 
-    def backward(ctx, *gradOutputs):
-        gradInputs = comm_all_reduce(list(gradOutputs))
-        return tuple(gradInputs)
-
-
-class Broadcast(Function):
-    """Multi-GPU broadcast autograd function
-    """
-    def __init__(self, target_gpus):
-        super(Broadcast, self).__init__()
-        self.target_gpus = target_gpus
-
-    def forward(self, *inputs):
-        if not all(input.is_cuda for input in inputs):
-            raise TypeError('Broadcast function not implemented for CPU tensors')
-        if len(inputs) == 0:
-            return tuple()
-        self.num_inputs = len(inputs)
-        self.input_device = inputs[0].get_device()
-        outputs = comm.broadcast_coalesced(inputs, self.target_gpus)
+class AllReduce(Function):
+    @staticmethod
+    def forward(ctx, num_inputs, *inputs):
+        ctx.num_inputs = num_inputs
+        ctx.target_gpus = [inputs[i].get_device() for i in range(0, len(inputs), num_inputs)]
+        inputs = [inputs[i:i + num_inputs]
+                 for i in range(0, len(inputs), num_inputs)]
+        # sort before reduce sum
+        inputs = sorted(inputs, key=lambda i: i[0].get_device())
+        results = comm.reduce_add_coalesced(inputs, ctx.target_gpus[0])
+        outputs = comm.broadcast_coalesced(results, ctx.target_gpus)
         return tuple([t for tensors in outputs for t in tensors])
 
-    def backward(self, *grad_outputs):
-        grad_outputs = [grad_outputs[i:i + self.num_inputs]
-                        for i in range(0, len(grad_outputs), self.num_inputs)]
-        return comm.reduce_add_coalesced(grad_outputs, self.input_device)
+    @staticmethod
+    def backward(ctx, *inputs):
+        inputs = [i.data for i in inputs]
+        inputs = [inputs[i:i + ctx.num_inputs]
+                 for i in range(0, len(inputs), ctx.num_inputs)]
+        results = comm.reduce_add_coalesced(inputs, ctx.target_gpus[0])
+        outputs = comm.broadcast_coalesced(results, ctx.target_gpus)
+        return (None,) + tuple([Variable(t) for tensors in outputs for t in tensors])
 
 
-class ModelDataParallel(Module):
+class Reduce(Function):
+    @staticmethod
+    def forward(ctx, *inputs):
+        ctx.target_gpus = [inputs[i].get_device() for i in range(len(inputs))]
+        inputs = sorted(inputs, key=lambda i: i.get_device())
+        return comm.reduce_add(inputs)
+
+    @staticmethod
+    def backward(ctx, gradOutput):
+        return Broadcast.apply(ctx.target_gpus, gradOutput)
+
+
+class DataParallelModel(DataParallel):
     """Implements data parallelism at the module level.
 
-    Reference:
-        Hang Zhang, Kristin Dana, Jianping Shi, Zhongyue Zhang, Xiaogang Wang, Ambrish Tyagi, Amit Agrawal. “Context Encoding for Semantic Segmentation. CVPR 2018
-
     This container parallelizes the application of the given module by
-    splitting the input across the specified devices by chunking in the 
-    batch dimension. 
+    splitting the input across the specified devices by chunking in the
+    batch dimension.
     In the forward pass, the module is replicated on each device,
-    and each replica handles a portion of the input. During the backwards
-    pass, gradients from each replica are summed into the original module.
-    Note that the outputs are not gathered, please use compatible 
-    :class:`encoding.parallel.CriterionDataParallel`.
+    and each replica handles a portion of the input. During the backwards pass, gradients from each replica are summed into the original module.
+    Note that the outputs are not gathered, please use compatible
+    :class:`encoding.parallel.DataParallelCriterion`.
 
     The batch size should be larger than the number of GPUs used. It should
     also be an integer multiple of the number of GPUs so that each chunk is
@@ -121,251 +83,106 @@ class ModelDataParallel(Module):
         module: module to be parallelized
         device_ids: CUDA devices (default: all devices)
 
+    Reference:
+        Hang Zhang, Kristin Dana, Jianping Shi, Zhongyue Zhang, Xiaogang Wang, Ambrish Tyagi,
+        Amit Agrawal. “Context Encoding for Semantic Segmentation.
+        *The IEEE Conference on Computer Vision and Pattern Recognition (CVPR) 2018*
+
     Example::
 
-        >>> net = encoding.nn.ModelDataParallel(model, device_ids=[0, 1, 2])
-        >>> output = net(input_var)
+        >>> net = encoding.nn.DataParallelModel(model, device_ids=[0, 1, 2])
+        >>> y = net(x)
     """
-    def __init__(self, module, device_ids=None, output_device=None, dim=0):
-        super(ModelDataParallel, self).__init__()
-        if device_ids is None:
-            device_ids = list(range(torch.cuda.device_count()))
-        if output_device is None:
-            output_device = device_ids[0]
-        self.dim = dim
-        self.module = module
-        self.device_ids = device_ids
-        self.output_device = output_device
-        self.master_mean, self.master_var = {}, {}
-        if len(self.device_ids) == 1:
-            self.module.cuda(device_ids[0])
-        """
-        # TODO FIXME temporal solution for BN
-        for m in self.module.modules():
-            classname = m.__class__.__name__ 
-            if classname.find('BatchNorm2d') != -1:
-                m.momentum = 0.9996
-        """
-
-    def forward(self, *inputs, **kwargs):
-        inputs, kwargs = self.scatter(inputs, kwargs, self.device_ids)
-        if len(self.device_ids) == 1:
-            return self.module(*inputs[0], **kwargs[0])
-        replicas = self.replicate(self.module, \
-            self.device_ids[:len(inputs)])
-        outputs = self.parallel_apply(replicas, inputs, kwargs)
-        return outputs 
+    def gather(self, outputs, output_device):
+        return outputs
 
     def replicate(self, module, device_ids):
-        return replicate(module, device_ids)
+        modules = super(DataParallelModel, self).replicate(module, device_ids)
+        execute_replication_callbacks(modules)
+        return modules
 
-    def scatter(self, inputs, kwargs, device_ids):
-        return scatter_kwargs(inputs, kwargs, device_ids, dim=self.dim)
 
-    def parallel_apply(self, replicas, inputs, kwargs):
-        return parallel_apply(replicas, inputs, kwargs)
-
-    
-class CriterionDataParallel(Module):
+class DataParallelCriterion(DataParallel):
     """
-    Calculate loss in multiple-GPUs, which balance the memory usage for 
+    Calculate loss in multiple-GPUs, which balance the memory usage for
     Semantic Segmentation.
 
-    Reference:
- 
-        Hang Zhang, Kristin Dana, Jianping Shi, Zhongyue Zhang, Xiaogang Wang, Ambrish Tyagi, Amit Agrawal. “Context Encoding for Semantic Segmentation. CVPR 2018
-
     The targets are splitted across the specified devices by chunking in
-    the batch dimension. Please use together with :class:`encoding.parallel.ModelDataParallel`.
-    """
-    def __init__(self, module, device_ids=None, output_device=None, dim=0):
-        super(CriterionDataParallel, self).__init__()
-        if device_ids is None:
-            device_ids = list(range(torch.cuda.device_count()))
-        if output_device is None:
-            output_device = device_ids[0]
-        self.dim = dim
-        self.module = module
-        self.device_ids = device_ids
-        self.output_device = output_device
-        if len(self.device_ids) == 1:
-            self.module.cuda(device_ids[0])
+    the batch dimension. Please use together with :class:`encoding.parallel.DataParallelModel`.
 
+    Reference:
+        Hang Zhang, Kristin Dana, Jianping Shi, Zhongyue Zhang, Xiaogang Wang, Ambrish Tyagi,
+        Amit Agrawal. “Context Encoding for Semantic Segmentation.
+        *The IEEE Conference on Computer Vision and Pattern Recognition (CVPR) 2018*
+
+    Example::
+
+        >>> net = encoding.nn.DataParallelModel(model, device_ids=[0, 1, 2])
+        >>> criterion = encoding.nn.DataParallelCriterion(criterion, device_ids=[0, 1, 2])
+        >>> y = net(x)
+        >>> loss = criterion(y, target)
+    """
     def forward(self, inputs, *targets, **kwargs):
         # input should be already scatterd
         # scattering the targets instead
+        if not self.device_ids:
+            return self.module(inputs, *targets, **kwargs)
         targets, kwargs = self.scatter(targets, kwargs, self.device_ids)
         if len(self.device_ids) == 1:
             return self.module(inputs, *targets[0], **kwargs[0])
         replicas = self.replicate(self.module, self.device_ids[:len(inputs)])
-        outputs = self.parallel_apply(replicas, inputs, targets, kwargs)
-        return self.gather(outputs, self.output_device)
-
-    def replicate(self, module, device_ids):
-        return replicate(module, device_ids)
-
-    def scatter(self, inputs, kwargs, device_ids):
-        return scatter_kwargs(inputs, kwargs, device_ids, dim=self.dim)
-
-    def parallel_apply(self, replicas, inputs, targets, kwargs):
-        return criterion_parallel_apply(replicas, inputs, targets, kwargs)
-
-    def gather(self, outputs, output_device):
-        return gather(outputs, output_device, dim=self.dim).mean()
-    
-
-class SelfDataParallel(Module):
-    """SelfDataParallel, please make sure you understand it before using.
-
-    Reference:
-
-        Hang Zhang, Kristin Dana, Jianping Shi, Zhongyue Zhang, Xiaogang Wang, Ambrish Tyagi, Amit Agrawal. “Context Encoding for Semantic Segmentation. CVPR 2018
-
-    Each module in the network should be in self-parallel mode, 
-    which allows list of inputs from multiple GPUs.
-    Please see :class:`encoding.nn` for detail, use with cautious
-    """
-    def __init__(self, module, device_ids=None, output_device=None, dim=0):
-        super(SelfDataParallel, self).__init__()
-        if device_ids is None:
-            device_ids = list(range(torch.cuda.device_count()))
-        if output_device is None:
-            output_device = device_ids[0]
-        self.dim = dim
-        self.module = module
-        self.device_ids = device_ids
-        self.output_device = output_device
-        self.master_mean, self.master_var = {}, {}
-        if len(self.device_ids) == 1:
-            self.module.cuda(device_ids[0])
-
-    def forward(self, *inputs, **kwargs):
-        inputs, kwargs = self.scatter(inputs, kwargs, self.device_ids)
-        if self.training:
-            # self parallel mode
-            outputs = self.module(inputs)
-            return outputs
-        else:
-            # TODO check faster?
-            if len(self.device_ids) == 1:
-                return self.module(*inputs[0], **kwargs[0])
-            replicas = self.replicate(self.module, \
-                self.device_ids[:len(inputs)])
-            outputs = self.parallel_apply(replicas, inputs, kwargs)
-            return outputs 
-            
-    def replicate(self, module, device_ids):
-        return replicate(module, device_ids)
-
-    def parallel_apply(self, replicas, inputs, kwargs):
-        return parallel_apply(replicas, inputs, kwargs)
-
-    def scatter(self, inputs, kwargs, device_ids):
-        outputs = scatter_kwargs(inputs, kwargs, device_ids, dim=self.dim)
-        return outputs
+        outputs = _criterion_parallel_apply(replicas, inputs, targets, kwargs)
+        return Reduce.apply(*outputs) / len(outputs)
+        #return self.gather(outputs, self.output_device).mean()
 
 
-def criterion_parallel_apply(modules, inputs, targets, kwargs_tup=None):
+def _criterion_parallel_apply(modules, inputs, targets, kwargs_tup=None, devices=None):
     assert len(modules) == len(inputs)
     assert len(targets) == len(inputs)
     if kwargs_tup:
         assert len(modules) == len(kwargs_tup)
     else:
         kwargs_tup = ({},) * len(modules)
-    # Fast track
-    if len(modules) == 1:
-        return (modules[0](*inputs[0], *targets[0], **kwargs_tup[0]), )
-
-    lock = threading.Lock()
-    results = {}
-
-    def _worker(i, module, input, target, kwargs, results, lock):
-        var_input = input
-        while not isinstance(var_input, Variable):
-            var_input = var_input[0]
-        var_target = target
-        while not isinstance(var_target, Variable):
-            var_target = var_target[0]
-        try:
-            with torch.cuda.device_of(var_input):
-                output = module(input, *target, **kwargs)
-            with lock:
-                results[i] = output
-        except Exception as e:
-            with lock:
-                results[i] = e
-
-    threads = [threading.Thread(target=_worker,
-                                args=(i, module, input, target, 
-                                      kwargs, results, lock),
-                                )
-               for i, (module, input, target, kwargs) in
-               enumerate(zip(modules, inputs, targets, kwargs_tup))]
-
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    outputs = []
-    for i in range(len(inputs)):
-        output = results[i]
-        if isinstance(output, Exception):
-            raise output
-        outputs.append(output)
-    return outputs
-
-
-def get_a_var(obj):
-    if isinstance(obj, Variable):
-        return obj
-
-    if isinstance(obj, list) or isinstance(obj, tuple):
-        results = map(get_a_var, obj)
-        for result in results:
-            if isinstance(result, Variable):
-                return result
-    if isinstance(obj, dict):
-        results = map(get_a_var, obj.items())
-        for result in results:
-            if isinstance(result, Variable):
-                return result
-    return None
-
-
-def my_parallel_apply(modules, inputs, kwargs_tup=None):
-    assert len(modules) == len(inputs)
-    if kwargs_tup:
-        assert len(modules) == len(kwargs_tup)
+    if devices is not None:
+        assert len(modules) == len(devices)
     else:
-        kwargs_tup = ({},) * len(modules)
-    # Fast track
-    if len(modules) == 1:
-        return (modules[0](*inputs[0], **kwargs_tup[0]), )
+        devices = [None] * len(modules)
 
     lock = threading.Lock()
     results = {}
+    if torch_ver != "0.3":
+        grad_enabled = torch.is_grad_enabled()
 
-    def _worker(i, module, input, kwargs, results, lock):
-        var_input = get_a_var(input)
+    def _worker(i, module, input, target, kwargs, device=None):
+        if torch_ver != "0.3":
+            torch.set_grad_enabled(grad_enabled)
+        if device is None:
+            device = get_a_var(input).get_device()
         try:
-            with torch.cuda.device_of(var_input):
-                output = module(input, **kwargs)
+            if not isinstance(input, tuple):
+                input = (input,)
+            with torch.cuda.device(device):
+                output = module(*(input + target), **kwargs)
             with lock:
                 results[i] = output
         except Exception as e:
             with lock:
                 results[i] = e
 
-    threads = [threading.Thread(target=_worker,
-                                args=(i, module, input, kwargs, results, lock),
-                                )
-               for i, (module, input, kwargs) in
-               enumerate(zip(modules, inputs, kwargs_tup))]
+    if len(modules) > 1:
+        threads = [threading.Thread(target=_worker,
+                                    args=(i, module, input, target,
+                                          kwargs, device),)
+                   for i, (module, input, target, kwargs, device) in
+                   enumerate(zip(modules, inputs, targets, kwargs_tup, devices))]
 
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    else:
+        _worker(0, modules[0], inputs[0], kwargs_tup[0], devices[0])
+
     outputs = []
     for i in range(len(inputs)):
         output = results[i]
@@ -375,16 +192,60 @@ def my_parallel_apply(modules, inputs, kwargs_tup=None):
     return outputs
 
 
-def my_data_parallel(module, inputs, device_ids=None, \
-    dim=0, module_kwargs=None):
-    if device_ids is None:
-        device_ids = list(range(torch.cuda.device_count()))
+###########################################################################
+# Adapted from Synchronized-BatchNorm-PyTorch.
+# https://github.com/vacancy/Synchronized-BatchNorm-PyTorch
+#
+class CallbackContext(object):
+    pass
 
-    if len(inputs) == 1:
-        return module(inputs[0])
 
-    #print('my data parallel, len(inputs)', len(inputs))
-    replicas = replicate(module, device_ids[:len(inputs)])
-    outputs = my_parallel_apply(replicas, inputs, module_kwargs)
-    return outputs 
+def execute_replication_callbacks(modules):
+    """
+    Execute an replication callback `__data_parallel_replicate__` on each module created
+    by original replication.
 
+    The callback will be invoked with arguments `__data_parallel_replicate__(ctx, copy_id)`
+
+    Note that, as all modules are isomorphism, we assign each sub-module with a context
+    (shared among multiple copies of this module on different devices).
+    Through this context, different copies can share some information.
+
+    We guarantee that the callback on the master copy (the first copy) will be called ahead
+    of calling the callback of any slave copies.
+    """
+    master_copy = modules[0]
+    nr_modules = len(list(master_copy.modules()))
+    ctxs = [CallbackContext() for _ in range(nr_modules)]
+
+    for i, module in enumerate(modules):
+        for j, m in enumerate(module.modules()):
+            if hasattr(m, '__data_parallel_replicate__'):
+                m.__data_parallel_replicate__(ctxs[j], i)
+
+
+def patch_replication_callback(data_parallel):
+    """
+    Monkey-patch an existing `DataParallel` object. Add the replication callback.
+    Useful when you have customized `DataParallel` implementation.
+
+    Examples:
+        > sync_bn = SynchronizedBatchNorm1d(10, eps=1e-5, affine=False)
+        > sync_bn = DataParallel(sync_bn, device_ids=[0, 1])
+        > patch_replication_callback(sync_bn)
+        # this is equivalent to
+        > sync_bn = SynchronizedBatchNorm1d(10, eps=1e-5, affine=False)
+        > sync_bn = DataParallelWithCallback(sync_bn, device_ids=[0, 1])
+    """
+
+    assert isinstance(data_parallel, DataParallel)
+
+    old_replicate = data_parallel.replicate
+
+    @functools.wraps(old_replicate)
+    def new_replicate(module, device_ids):
+        modules = old_replicate(module, device_ids)
+        execute_replication_callbacks(modules)
+        return modules
+
+    data_parallel.replicate = new_replicate
