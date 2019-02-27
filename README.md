@@ -15,6 +15,9 @@ To install PyTorch, please refer to https://github.com/pytorch/pytorch#installat
 
 Or using anaconda:  conda env create -f environment.yaml  
 
+
+Or to use Pytorch 1.0, just replace 'libs' with 'modules' in [https://github.com/mapillary/inplace_abn](https://github.com/mapillary/inplace_abn), and rename it to 'libs'. 
+
 ### Compiling
 
 Some parts of InPlace-ABN have a native CUDA implementation, which must be compiled with the following commands:
