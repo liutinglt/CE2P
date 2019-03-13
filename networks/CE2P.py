@@ -194,7 +194,7 @@ class Decoder_Module(nn.Module):
     def forward(self, xt, xl):
         _, _, h, w = xl.size()
 
-        xt = F.interpolate(self.conv1(xt), size=(h, w), mode='bilinear')
+        xt = F.interpolate(self.conv1(xt), size=(h, w), mode='bilinear', align_corners=True)
         xl = self.conv2(xl)
         x = torch.cat([xt, xl], dim=1)
         x = self.conv3(x)
