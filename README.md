@@ -70,11 +70,11 @@ The parsing result of the provided 'LIP_epoch_149.pth' is 53.88 without any bell
 
 If this code is helpful for your research, please cite the following paper:
 
-@inproceedings{ruan2019devil,
-  title={Devil in the details: Towards accurate single and multiple human parsing},
-  author={Ruan, Tao and Liu, Ting and Huang, Zilong and Wei, Yunchao and Wei, Shikui and Zhao, Yao},
-  booktitle={Proceedings of the AAAI Conference on Artificial Intelligence},
-  volume={33},
-  pages={4814--4821},
-  year={2019}
-}
+    @inproceedings{ruan2019devil,
+      title={Devil in the details: Towards accurate single and multiple human parsing},
+      author={Ruan, Tao and Liu, Ting and Huang, Zilong and Wei, Yunchao and Wei, Shikui and Zhao, Yao},
+      booktitle={Proceedings of the AAAI Conference on Artificial Intelligence},
+      volume={33},
+      pages={4814--4821},
+      year={2019}
+    }
